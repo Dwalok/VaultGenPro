@@ -8,12 +8,14 @@ Modern, lightweight CLI password manager written in Python. Uses a master passwo
 - Secure notes: create, read, edit, delete
 - Built-in password generator with entropy estimate
 - Modern CLI with sub-menus (Main -> Vault / Notes / Generator)
+- Change master password (re-key + new salt)
 - Encrypted local vault file (`vault.json`)
 
 ## Security model
 - Key derivation: scrypt (auto-tuned on first run, target ~300ms)
 - Encryption: AES-GCM with unique nonce per save
 - Atomic writes to prevent vault corruption
+- Single-instance lock file to avoid concurrent writes
 - Passwords masked by default; reveal per ID with confirmation
 - If you lose the master password, the vault cannot be recovered
 
@@ -56,6 +58,7 @@ After launch, follow the menus:
 - Vault
 - Notes
 - Password generator
+- Change master password
 
 ### Vault
 - View passwords (masked by default)
@@ -65,7 +68,8 @@ After launch, follow the menus:
 - Delete a password
 
 ### Notes
-- View notes
+- View notes (preview)
+- Reveal note by ID
 - Add note
 - Edit note
 - Delete note
@@ -90,11 +94,13 @@ Behavior options:
 - `REVEAL_MODE = "enter"` (or `"timeout"`) and `REVEAL_TIMEOUT_SECONDS`
 - `INACTIVITY_LOCK_SECONDS` (set to `0` to disable)
 - `KDF_AUTO_TUNE`, `KDF_TARGET_MS`, `KDF_MAX_N`
+- `NOTES_PREVIEW_LEN` for note truncation
 
 ## Vault file
 - Stored in `vault.json` next to the script
 - Do not commit this file to git
 - Back it up if you want a safe offline copy
+- If the app crashes, a `.lock` file may remain; delete it to unlock the vault
 
 ## Notes
 This project is intended for local use. Review the code and security parameters if you plan to extend it.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import math
@@ -42,6 +43,8 @@ REVEAL_TIMEOUT_SECONDS = 10
 ENTRY_ID_DISPLAY_LEN = 8
 REVEAL_MODE = "enter"  # "enter" or "timeout"
 INACTIVITY_LOCK_SECONDS = 300  # set 0 to disable
+NOTES_PREVIEW_LEN = 40
+LOCK_SUFFIX = ".lock"
 
 BANNER_TEXT_STYLE = "#89B4FA"
 BANNER_BORDER_STYLE = "#89B4FA"
@@ -69,9 +72,10 @@ MAIN_MENU_OPTIONS = (
     ("1", "Vault"),
     ("2", "Notes"),
     ("3", "Password generator"),
-    ("4", "Exit"),
+    ("4", "Change master password"),
+    ("5", "Exit"),
 )
-MAIN_MENU_DEFAULT = "4"
+MAIN_MENU_DEFAULT = "5"
 MAIN_MENU_CHOICES = tuple(key for key, _ in MAIN_MENU_OPTIONS)
 
 VAULT_MENU_OPTIONS = (
@@ -94,12 +98,13 @@ GEN_MENU_CHOICES = tuple(key for key, _ in GEN_MENU_OPTIONS)
 
 NOTES_MENU_OPTIONS = (
     ("1", "View notes"),
-    ("2", "Add note"),
-    ("3", "Edit note"),
-    ("4", "Delete note"),
-    ("5", "Back"),
+    ("2", "Reveal note"),
+    ("3", "Add note"),
+    ("4", "Edit note"),
+    ("5", "Delete note"),
+    ("6", "Back"),
 )
-NOTES_MENU_DEFAULT = "5"
+NOTES_MENU_DEFAULT = "6"
 NOTES_MENU_CHOICES = tuple(key for key, _ in NOTES_MENU_OPTIONS)
 
 BANNER = r"""
@@ -142,6 +147,37 @@ def _mask_password(value: str) -> str:
     if not value:
         return ""
     return PASSWORD_MASK_CHAR * max(PASSWORD_MASK_MIN_LEN, len(value))
+
+
+def _truncate(value: str, max_len: int) -> str:
+    if max_len <= 0 or not value:
+        return value
+    if len(value) <= max_len:
+        return value
+    if max_len <= 3:
+        return value[:max_len]
+    return f"{value[: max_len - 3]}..."
+
+
+def _release_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _acquire_lock(path: Path) -> Path:
+    lock_path = path.with_name(path.name + LOCK_SUFFIX)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise VaultError(
+            "Vault is already in use (lock file exists). Close other instances or delete the .lock file."
+        ) from exc
+    with os.fdopen(fd, "w") as handle:
+        handle.write(str(os.getpid()))
+    atexit.register(_release_lock, lock_path)
+    return lock_path
 
 
 LAST_ACTIVITY = time.monotonic()
@@ -430,6 +466,47 @@ def _prompt_new_master(console: Console) -> str:
         return first
 
 
+def _prompt_master_change(console: Console) -> Optional[str]:
+    try:
+        while True:
+            first = Prompt.ask("New master password", password=True)
+            second = Prompt.ask("Confirm new master password", password=True)
+            if first != second:
+                console.print("Passwords do not match. Try again.", style=COLOR_ERROR)
+                continue
+            if len(first) < 8:
+                console.print("Password too short (min 8 chars).", style=COLOR_ERROR)
+                continue
+            return first
+    except KeyboardInterrupt:
+        console.print("\nCanceled.", style=COLOR_WARNING)
+        return None
+
+
+def _change_master_password(
+    console: Console, session: VaultSession, data: VaultData, path: Path
+) -> VaultSession:
+    with _activity_scope():
+        console.print("Change master password", style=COLOR_INFO)
+        new_master = _prompt_master_change(console)
+        if not new_master:
+            return session
+
+        salt = os.urandom(16)
+        password_bytes = new_master.encode("utf-8")
+        if KDF_AUTO_TUNE:
+            console.print(
+                "Calibrating encryption (change master)...", style=COLOR_INFO
+            )
+        params, key = _calibrate_kdf(password_bytes, salt)
+        password_bytes = b""
+        new_master = ""
+        new_session = VaultSession(key=key, salt=salt, kdf_params=params)
+        _save_vault(path, new_session, data)
+        console.print("Master password updated.", style=COLOR_SUCCESS)
+        return new_session
+
+
 def _unlock_vault(console: Console, path: Path) -> tuple[VaultSession, VaultData]:
     if not path.exists():
         master = _prompt_new_master(console)
@@ -480,12 +557,13 @@ def _render_entries_table(
     for entry in entries:
         password = entry.get("password", "")
         display_password = password if show_passwords else _mask_password(password)
+        notes_preview = _truncate(entry.get("notes", ""), NOTES_PREVIEW_LEN)
         table.add_row(
             _short_id(entry.get("id", "")),
             entry.get("name", ""),
             entry.get("username", ""),
             entry.get("url", ""),
-            entry.get("notes", ""),
+            notes_preview,
             display_password,
         )
 
@@ -707,10 +785,58 @@ def _view_notes(console: Console, data: VaultData) -> None:
             table.add_row(
                 _short_id(note.get("id", "")),
                 note.get("title", ""),
-                note.get("body", ""),
+                _truncate(note.get("body", ""), NOTES_PREVIEW_LEN),
             )
 
         console.print(table)
+
+
+def _reveal_note(console: Console, data: VaultData) -> None:
+    with _activity_scope():
+        if not data.notes:
+            console.print("No notes stored yet.", style=COLOR_WARNING)
+            return
+
+        table = Table(title="Select note to reveal", box=box.SIMPLE_HEAVY)
+        table.add_column("ID", style=COLOR_ID, width=ENTRY_ID_DISPLAY_LEN, justify="right")
+        table.add_column("Title", style="bold")
+        table.add_column("Preview")
+        for note in data.notes:
+            table.add_row(
+                _short_id(note.get("id", "")),
+                note.get("title", ""),
+                _truncate(note.get("body", ""), NOTES_PREVIEW_LEN),
+            )
+
+        console.print(table)
+        try:
+            target = Prompt.ask("Reveal which ID? (blank to cancel)", default="").strip()
+        except KeyboardInterrupt:
+            console.print("\nCanceled.", style=COLOR_WARNING)
+            return
+        if not target:
+            console.print("Reveal canceled.", style=COLOR_WARNING)
+            return
+        try:
+            match = _find_by_id(data.notes, target)
+        except VaultError as exc:
+            console.print(str(exc), style=COLOR_ERROR)
+            return
+        if match is None:
+            console.print("ID not found.", style=COLOR_ERROR)
+            return
+
+        _, note = match
+        if not Confirm.ask(f"Reveal note '{note.get('title', '')}'?", default=False):
+            console.print("Reveal canceled.", style=COLOR_WARNING)
+            return
+
+        console.print(note.get("body", ""), style=COLOR_INFO)
+        try:
+            console.input("Press Enter to hide ")
+        except KeyboardInterrupt:
+            console.print("\nCanceled.", style=COLOR_WARNING)
+            return
 
 
 def _add_note(console: Console, data: VaultData) -> None:
@@ -905,17 +1031,19 @@ def _notes_menu(console: Console, session: VaultSession, data: VaultData, path: 
         console.print(f"Notes: {len(data.notes)}", style=COLOR_INFO)
 
         choice = _ask_menu_choice(console, NOTES_MENU_CHOICES, NOTES_MENU_DEFAULT)
-        if choice is None or choice == "5":
+        if choice is None or choice == "6":
             return
         if choice == "1":
             _view_notes(console, data)
         elif choice == "2":
+            _reveal_note(console, data)
+        elif choice == "3":
             _add_note(console, data)
             _save_vault(path, session, data)
-        elif choice == "3":
+        elif choice == "4":
             _edit_note(console, data)
             _save_vault(path, session, data)
-        elif choice == "4":
+        elif choice == "5":
             _delete_note(console, data)
             _save_vault(path, session, data)
 
@@ -939,6 +1067,8 @@ def _menu(console: Console, session: VaultSession, data: VaultData, path: Path) 
         elif choice == "3":
             _generator_menu(console)
         elif choice == "4":
+            session = _change_master_password(console, session, data, path)
+        elif choice == "5":
             console.print("Bye!", style=COLOR_INFO)
             break
 
@@ -947,6 +1077,11 @@ def main() -> None:
     console = Console()
     console.clear()
     _print_banner(console)
+    try:
+        _acquire_lock(VAULT_PATH)
+    except VaultError as exc:
+        console.print(str(exc), style=COLOR_ERROR)
+        raise SystemExit(1)
     try:
         session, data = _unlock_vault(console, VAULT_PATH)
     except KeyboardInterrupt:
